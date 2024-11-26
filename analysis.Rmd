@@ -1,0 +1,542 @@
+---
+title: "Bioinformatics Resources Project"
+author: "Gagliardi Alessandro, Gialdi Gabriele"
+date: "18/06/23"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+Importing the libraries
+
+```{r import_libraries, message=FALSE, warning=FALSE}
+library(biomaRt)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(enrichplot)
+library(ggnewscale)
+library(DOSE)
+library(pathview)
+library(tidyverse)
+library(edgeR)
+library(scales)
+library(plotly)
+library(MotifDb)
+library(seqLogo)
+library(PWMEnrich)
+library(PWMEnrich.Hsapiens.background)
+library(igraph)
+```
+### TASK 0
+Set the right working directory and load the RNA-seq data regarding 50 liver hepatocellular carcinoma patients and 50 controls 
+
+```{r setwd, message=FALSE}
+setwd("/Users/alessandrogagliardi/Documents/university/bioinfo_res/project/project_Gagliardi_Gialdi")
+load("Liver_hepatocellular_carcinoma.RData")
+```
+
+### TASK 1
+Update raw_count_df and r_anno_df extracting only protein coding genes.
+
+```{r ensembl, message=FALSE}
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", mirror = "asia")
+```
+
+```{r update_data, message=FALSE}
+genesAttr <- getBM(attributes=c("external_gene_name","ensembl_gene_id","description","gene_biotype","start_position","end_position","chromosome_name","strand", "entrezgene_id"),
+        filters=c("ensembl_gene_id"), 
+        values=r_anno_df[,1],
+        mart = ensembl)
+
+#we keep only those genes coding for protein
+genesAttr <- genesAttr[genesAttr$gene_biotype=="protein_coding",]
+
+presAbs <- r_anno_df[,1] %in% genesAttr[,2]
+r_anno_df <- r_anno_df[presAbs,]
+
+presAbs2 <- rownames(raw_counts_df) %in% genesAttr[,2]
+raw_counts_df <- raw_counts_df[presAbs2,]
+
+#ordering annotation table based on case/control
+c_anno_df <- c_anno_df[order(c_anno_df$condition),]
+
+```
+
+### TASK 2
+Perform differential expression analysis using edgeR package and select up- and down-regulated genes using a p-value cutoff of 0.01, a log fold change ratio >1.5 for up-regulated genes and < (-1.5) for down-regulated genes and a log CPM >1. Relax the thresholds if no or few results are available.
+
+- Filter raw counts data retaining only genes with a raw count >20 in at least 5 Cases or 5 Control samples
+
+
+```{r filtering, message=FALSE}
+#filter row counts reads
+
+count_thr <- 20
+# number of replicates with more counts than the count threshold
+repl_thr <- 5
+
+filter_vec <- apply(raw_counts_df,1,
+    function(y) max(by(y, c_anno_df$condition, function(x) sum(x>=count_thr))))
+# see statistics for the filtering
+#View(filter_vec) 
+
+filter_counts_df <- raw_counts_df[filter_vec>=repl_thr,]
+
+#ordering columns based on case/control
+col_order <- c_anno_df$sample
+filter_counts_df <- filter_counts_df[, col_order]
+
+#type(filter_counts_df)
+# apply the filter on gene annotation
+filter_anno_df <- r_anno_df[rownames(filter_counts_df),]
+
+```
+
+Display cluster dendogram for a first exploratory analysis
+
+```{r dendogram, message=FALSE}
+# scale for rows to normalize for basal expression level differences
+clu_data <- scale(t(filter_counts_df))
+# distance matrix 
+dd <- dist(clu_data, method = "euclidean") 
+hc <- hclust(dd, method="ward.D")
+# display dendogram
+plot(hc, labels = FALSE) 
+```
+
+DEG analysis with edgeR:
+- creation of a CPM table
+- Principal Component Analysis (PCA) in 2D and 3D
+
+```{r PCA, fig.width=10, message=FALSE}
+# create a DGRList object
+edge_c <- DGEList(counts=filter_counts_df,group=c_anno_df$condition,samples=c_anno_df,genes=filter_anno_df) 
+#View(edge_c)
+
+# normalization with the edgeR package (TMM method)
+edge_n <- calcNormFactors(edge_c,method="TMM")
+#edge_n
+
+# create a cpm table (normalized expression values)
+cpm_table <- as.data.frame(round(cpm(edge_n),2))
+head(cpm_table)
+cpm_adj =log((rescale(as.matrix(cpm_table), to=c(1,1*10^8))), base = 10)
+cpm_adj = scale(cpm_adj)
+
+#PCR on normalized matrix
+data.matrix <- cpm_adj
+color <- c(rep("red",50),rep("blue",50))
+data.PC <- prcomp(t(data.matrix),scale.=TRUE)
+plot(data.PC$x[,1:2],xlim=c(-200,200),ylim=c(-200,200),col=color,pch=19)
+
+#3D PCA
+lab <- c(rep("control",50),rep("tumor",50))
+comp <- as.data.frame(data.PC$x)
+plotly::plot_ly(comp, x = ~PC1, y = ~PC2, z = ~PC3, color = lab)
+```
+Starting from the PCA analysis, it is already evident the clustering of control and test samples, which suggests and anticipates differences in expression levels.
+
+
+DIFFERENTIAL EXPRESSION ANALYSIS
+
+```{r DEGs, message=FALSE}
+design <- model.matrix(~0+group, data=edge_n$samples)
+colnames(design) <- levels(edge_n$samples$group)
+rownames(design) <- edge_n$samples$sample
+#design
+
+# calculate dispersion and fit with edgeR 
+edge_d <- estimateDisp(edge_n,design)
+edge_f <- glmQLFit(edge_d,design) 
+
+# definition of the contrast 
+contro <- makeContrasts("case-control", levels=design) 
+
+# fit the model with generalized linear models
+edge_t <- glmQLFTest(edge_f,contrast=contro)
+DEGs <- as.data.frame(topTags(edge_t,n=20000, sort.by = "PValue"))
+DEGs$class <- "="
+DEGs$class[which(DEGs$logCPM>1&DEGs$logFC>1.5&DEGs$PValue<0.01)] = "+"
+DEGs$class[which(DEGs$logCPM>1&DEGs$logFC<(-1.5)&DEGs$PValue<0.01)] = "-"
+DEGs <- DEGs[order(DEGs$logFC,decreasing = T),]
+
+up_DEGs <- DEGs[which(DEGs$class=="+"),]
+down_DEGs <- DEGs[which(DEGs$class=="-"),]
+
+#head(DEGs)
+table(DEGs$class)
+pie(table(DEGs$class), labels = c("369 -","661 +", "15269 =" ), main = "DEGs proportion", col = c("blue4", "red", "grey"), density = 50)
+```
+We discovered 661 up-regulated and 369 down-regulated differentially expressed genes out of 16299 total genes.
+
+
+- Create a volcano plot and a heatmap of the results.
+
+```{r heatmap_and_volcano, fig.width=10, message=FALSE}
+## Heatmap with DEG genes
+cols <- c(rep("chartreuse4",50),rep("burlywood3",50)) 
+pal <- c("blue","white","red") 
+pal <- colorRampPalette(pal)(1000)
+heatmap(as.matrix(cpm_adj[which(rownames(cpm_adj)%in%DEGs$ensembl_gene_id[which(DEGs$class!="=")]),]), ColSideColors = cols, cexCol = 0.5,
+        margins = c(4,4),col=pal,cexRow = 0.2)
+
+## Display a Volcano plot of the results:
+input_df <- DEGs
+xlabel <- "log2 FC case vs control"
+ylabel <- "-log10 p-value"
+
+par(fig=c(0,1,0,1), mar=c(4,4,1,2), mgp=c(2, 0.75, 0))	
+plot(input_df$logFC, -log(input_df$PValue,base=10),xlab=xlabel, ylab=ylabel, 
+     col=ifelse(input_df$class=="=","grey70","olivedrab4"), pch=20, frame.plot=TRUE, cex=0.5, main="Volcano plot")
+abline(v=1.5,lty=2,col="grey20")
+abline(v=-1.5,lty=2, col="grey20")
+abline(h=-log(0.01, base = 10), lty=3,col="grey29")
+```
+
+Writing DEGs tables into TSV files (we'll use them later)
+
+```{r writing_tables, message=FALSE}
+write.table(up_DEGs,file="up_DEGs.txt",row.names=F,col.names=T,sep="\t",quote=F)
+write.table(down_DEGs,file="down_DEGs.txt",row.names=F,col.names=T,sep="\t",quote=F)
+write.table(DEGs,file="DEGs.txt",row.names=F,col.names=T,sep="\t",quote=F)
+```
+
+### TASK 3
+
+Perform gene set enrichment analysis.
+
+```{r, message=FALSE}
+
+convert <- getBM(attributes=c("ensembl_gene_id","entrezgene_id","external_gene_name"),
+                 filters=c("ensembl_gene_id"), 
+                 values=DEGs$ensembl_gene_id,
+                 mart = ensembl)
+
+DEGs <- merge(DEGs,convert,by.x="ensembl_gene_id", by.y="ensembl_gene_id")
+dim(DEGs)
+DEGs <- DEGs[which(!is.na(DEGs$entrezgene_id)),]
+dim(DEGs)
+DEGs <- DEGs[-which(duplicated(DEGs$entrezgene_id)),]
+
+up_DEGs <- DEGs %>% filter(class == "+")
+down_DEGs <- DEGs %>% filter(class == "-")
+```
+
+- Perform both GO (BP and MF) and WP analysis
+- Report the top 10 enriched GO terms and the top 10 enriched WP pathways resulting from both up- and down-regulated gene lists
+
+```{r Gene_Enrichment, fig.width=10, message=FALSE, warning=FALSE}
+################
+### BP ONTOLOGY
+################
+
+ego_BP_up <- enrichGO(gene = up_DEGs$external_gene_name.x,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+## Visualize the top 10 enriched terms with a barplot 
+barplot(ego_BP_up,showCategory=10)
+
+## Visualize the top 10 enriched terms with a dotplot 
+dotplot(ego_BP_up, showCategory=10, label_format = 40)
+
+## Visualize the genes associated with the top 10 enriched terms with a heatplot 
+heatplot(ego_BP_up,showCategory = 10, label_format = 25)
+
+## Visualize with a network view the connection between the top 10 enriched terms 
+x2 <- pairwise_termsim(ego_BP_up) 
+emapplot(x2, cex_label_category = 0.3, cex_line = 0.2)
+
+
+ego_BP_down <- enrichGO(gene = down_DEGs$external_gene_name.x,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+## Visualize the top 10 enriched terms with a barplot 
+barplot(ego_BP_down,showCategory=10)
+
+## Visualize the top 10 enriched terms with a dotplot 
+dotplot(ego_BP_down, showCategory=10, label_format = 40)
+
+## Visualize the genes associated with the top 10 enriched terms with a heatplot 
+heatplot(ego_BP_down,showCategory = 10, label_format = 20)
+
+#### Visualize with a network view the connection between the top 10 enriched terms 
+x2 <- pairwise_termsim(ego_BP_down) 
+emapplot(x2, cex_label_category = 0.3, cex_line = 0.2)
+
+
+
+################
+### MF ONTOLOGY
+################
+
+ego_MF_up <- enrichGO(gene = up_DEGs$external_gene_name.x,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "MF",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+barplot(ego_MF_up,showCategory=10)
+
+dotplot(ego_MF_up, showCategory=10, label_format = 40)
+
+heatplot(ego_MF_up,showCategory = 10, label_format = 25)
+
+x2 <- pairwise_termsim(ego_MF_up) 
+emapplot(x2, cex_label_category = 0.3, cex_line = 0.2)
+
+
+ego_MF_down <- enrichGO(gene = down_DEGs$external_gene_name.x,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "MF",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+barplot(ego_MF_down,showCategory=10, label_format = 60)
+
+dotplot(ego_MF_down, showCategory=5, label_format = 40)
+
+heatplot(ego_MF_down,showCategory = 10, label_format = 80)
+
+x2 <- pairwise_termsim(ego_MF_down) 
+emapplot(x2, cex_label_category = 0.4, cex_line = 0.2)
+```
+### TASK 4
+Use the pathview R package to visualize one pathway you find enriched using the upregulated gene list.
+
+```{r WP_analysis, fig.width=10, message=FALSE, warning=FALSE}
+################
+### WP ANALYSIS
+################
+
+# up regulated genes
+
+eWP_up <- enrichWP(gene = up_DEGs$entrezgene_id,
+                    organism = 'Homo sapiens',
+                    pvalueCutoff = 0.01,
+                    qvalueCutoff = 0.1)
+
+barplot(eWP_up, showCategory = 10)
+
+
+
+# down regulated genes
+
+eWP_down <- enrichWP(gene = down_DEGs$entrezgene_id,
+                    organism = 'Homo sapiens',
+                    pvalueCutoff = 0.05,
+                    qvalueCutoff = 0.1)
+
+barplot(eWP_down, showCategory = 10)
+
+## Plot the pathways with DEG genes
+
+#transcriptional misregulation in cancer pathway
+logFC <- DEGs[which(DEGs$class != "="), ]$logFC
+names(logFC) <- DEGs[which(DEGs$class != "="), ]$entrezgene_id
+pathview(gene.data = logFC, 
+         pathway.id = "hsa05202", 
+         species = "human")
+
+#cell cycle pathway
+logFC <- DEGs[which(DEGs$class != "="), ]$logFC
+names(logFC) <- DEGs[which(DEGs$class != "="), ]$entrezgene_id
+pathview(gene.data = logFC, 
+         pathway.id = "04110", 
+         species = "human")
+```
+After performing GO and WP enrichment analyses in order to discover the most enriched MF and BP ontologies,we got some interesting results:
+
+- the most enriched biological processes suggest an up regulated cell cycle in the pathological condition (confirmed by the KEGG analysis);
+- the response to xenobiotic stimuli is down regulated, suggesting that tumor cells might have acquired some kind of drug resistance.
+
+
+### TASK 5
+Identify which transcription factors (TFs) have enriched scores in the promoters of all up-regulated (or down-regulated if you prefer) genes.
+a use a window of 500 nucleotides upstream each gene
+
+
+```{r TF_enrich, fig.width=10, message=FALSE}
+
+promoter_seq <- getSequence(id = up_DEGs$ensembl_gene_id, 
+                            type="ensembl_gene_id",
+                            seqType="gene_flank",
+                            upstream=500,
+                            mart=ensembl) 
+
+data(PWMLogn.hg19.MotifDb.Hsap)
+sequences <- lapply(promoter_seq$gene_flank,function(x) DNAString(x))
+#the motif enrichment data is already present in the folder "supplementary_project"
+enriched_TFs <- motifEnrichment(sequences,PWMLogn.hg19.MotifDb.Hsap,score = "affinity")
+report = groupReport(enriched_TFs)
+report
+plot(report[1:10], fontsize=9, id.fontsize=7)
+```
+
+### TASK 6
+Select one among the top enriched TFs,compute the empirical distributions of scores for all PWMs that you find in MotifDB for the selected TF and determine for all of them the distribution (log2) threshold cutoff at 99.75%.
+
+```{r empirical_distribution, message=FALSE}
+tf <- report$target[2]
+
+mdb.human.tf = subset(MotifDb, organism=='Hsapiens' & geneSymbol==tf)
+PWM = toPWM(as.list(mdb.human.tf))
+names(PWM) = sapply(names(PWM),function(x) strsplit(x,"-")[[1]][3])
+scores = motifScores(sequences = sequences,PWM,raw.score=T)
+# Empirical distribution for the motif
+
+ecdf = motifEcdf(PWM,organism = "hg19",quick=TRUE)
+thresholds = lapply(ecdf,function(x) log2(quantile(x,0.9975)))
+
+if (length(thresholds) != 1){
+  for(i in 1:length(thresholds)){
+  plotMotifScores(scores[1:10],sel.motifs=tf,  cols=c("red","green","blue"),cutoff=thresholds[i])
+  }
+} else{
+  plotMotifScores(scores[1:10],cols=c("red","green","blue"),cutoff=thresholds)
+}
+
+```
+
+### TASK 7
+Identify which up-regulated (or down-regulated depending on the choice you made at point 7) genes have a region in their promoter (defined as previously) with binding scores above the computed thresholds for any of the previously selected PWMs.
+a Use pattern matching as done during the course
+
+
+```{r, message=FALSE}
+scores2 = motifScores(sequences,PWM,raw.score=FALSE,cutoff=unlist(thresholds))
+up_reg_over_thersh <- c(up_DEGs[which(apply(scores2,1,sum)>0), ]$external_gene_name.x)
+head(up_reg_over_thersh)
+length(up_reg_over_thersh)
+```
+
+### TASK 8 and TASK 9
+
+Use STRING database to find PPI interactions among differentially expressed genes and export the network in TSV format.
+Import the network in R and using igraph package and identify and plot the largest connected component.
+
+PPI with up regulated genes:
+
+```{r PPI_up, fig.width=10, message=FALSE}
+
+UP_links <- read.delim("supplementary_project/STRING/UP_string_interactions.tsv")
+
+nodes_up <- 
+   getBM(attributes=c("external_gene_name","ensembl_gene_id","description","gene_biotype","start_position","end_position","chromosome_name","strand"),
+         filters=c("ensembl_gene_id"), 
+         values=up_DEGs[,1],
+         mart = ensembl)
+nodes_up = unique(nodes_up[,c(1,3:6)])
+
+## Create the network of up regulated genes
+
+#due to an unexpected error we selected only those nodes present also in the edge list
+edge_vertex_1_up <- UP_links$X.node1 %in% nodes_up[,1] 
+edge_vertex_2_up <- UP_links$node2 %in% nodes_up[,1] 
+UP_links <- UP_links[edge_vertex_1_up,]
+UP_links <- UP_links[edge_vertex_2_up,]
+
+edge_vertex_1_up <- UP_links$X.node1 %in% nodes_up[,1] 
+edge_vertex_2_up <- UP_links$node2 %in% nodes_up[,1] 
+UP_links <- UP_links[edge_vertex_1_up,]
+UP_links <- UP_links[edge_vertex_2_up,]
+
+net_up <- graph_from_data_frame(d=UP_links,vertices=nodes_up,directed=FALSE) 
+class(net_up)
+net_up
+
+
+## Plot the PPI network
+plot(net_up, 
+     edge.width=1,
+     vertex.color="orange",
+     vertex.size=10,
+     vertex.frame.color="darkgray",
+     vertex.label.color="black", 
+     vertex.label.cex=0.1,
+     edge.curved=0.1,
+     ) 
+
+## plot the largest connected component subgraph
+c <- components(net_up, mode = c("weak", "strong"))
+biggest_cluster_id <- which.max(c$csize)
+vert_ids <- V(net_up)[c$membership == biggest_cluster_id]
+net.c <- induced_subgraph(net_up, vert_ids)
+
+plot(net.c, 
+     edge.width=2,
+     vertex.color="orange",
+     vertex.size=10,
+     vertex.frame.color="darkgray",
+     vertex.label.color="blue4", 
+     vertex.label.cex=0.2,
+     edge.curved=0.1)
+```
+PPI with down regulated genes:
+
+```{r PPI_down, fig.width=10, message=FALSE}
+DOWN_links <- read.delim("supplementary_project/STRING/DOWN_string_interactions.tsv")
+
+nodes_down <- 
+   getBM(attributes=c("external_gene_name","ensembl_gene_id","description","gene_biotype","start_position","end_position","chromosome_name","strand"),
+         filters=c("ensembl_gene_id"), 
+         values=down_DEGs[,1],
+         mart = ensembl)
+nodes_down = unique(nodes_down[,c(1,3:6)])
+
+## Create the network of up regulated genes
+edge_vertex_1_down <- DOWN_links$X.node1 %in% nodes_down[,1] 
+edge_vertex_2_down <- DOWN_links$node2 %in% nodes_down[,1] 
+DOWN_links <- DOWN_links[edge_vertex_1_down,]
+DOWN_links <- DOWN_links[edge_vertex_2_down,]
+
+edge_vertex_1_down <- DOWN_links$X.node1 %in% nodes_down[,1] 
+edge_vertex_2_down <- DOWN_links$node2 %in% nodes_down[,1] 
+DOWN_links <- DOWN_links[edge_vertex_1_down,]
+DOWN_links <- DOWN_links[edge_vertex_2_down,]
+
+net_down <- graph_from_data_frame(d=DOWN_links,vertices=nodes_down,directed=FALSE) 
+class(net_down)
+net_down
+
+
+## Plot the PPI network
+plot(net_down, 
+     edge.width=1,
+     vertex.color="orange",
+     vertex.size=10,
+     vertex.frame.color="darkgray",
+     vertex.label.color="black", 
+     vertex.label.cex=0.1,
+     edge.curved=0.1,
+     ) 
+
+## plot the largest connected component subgraph
+c <- components(net_down, mode = c("weak", "strong"))
+biggest_cluster_id <- which.max(c$csize)
+vert_ids <- V(net_down)[c$membership == biggest_cluster_id]
+net.c <- induced_subgraph(net_down, vert_ids)
+
+plot(net.c, 
+     edge.width=2,
+     vertex.color="orange",
+     vertex.size=10,
+     vertex.frame.color="darkgray",
+     vertex.label.color="blue4", 
+     vertex.label.cex=0.2,
+     edge.curved=0.1)
+```
